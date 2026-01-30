@@ -12,22 +12,22 @@ st.set_page_config(page_title="DataFinscope – Piloto", layout="wide")
 # -----------------------
 def sharpe_ratio(returns, rf=0.0):
     returns = pd.Series(returns).dropna()
-    if returns.std() == 0 or len(returns) < 10:
+    if len(returns) < 10:
         return np.nan
-    return (returns.mean() - rf) / returns.std() * np.sqrt(252)
+    std = returns.std()
+    if std == 0 or np.isnan(std):
+        return np.nan
+    return (returns.mean() - rf) / std * np.sqrt(252)
 
 def max_drawdown(cum_curve):
     cum_curve = pd.Series(cum_curve).dropna()
+    if cum_curve.empty:
+        return np.nan, pd.Series(dtype=float)
     peak = cum_curve.cummax()
     dd = (cum_curve / peak) - 1
     return float(dd.min()), dd
 
-def minmax_0_100(x):
-    x = pd.Series(x).astype(float)
-    return 100 * (x - x.min()) / (x.max() - x.min() + 1e-9)
-
 def perfil_por_score(score_mixto):
-    # Ajusta si quieres: cortes recomendados para MVP
     if score_mixto < 35:
         return "Conservador"
     elif score_mixto < 70:
@@ -36,7 +36,6 @@ def perfil_por_score(score_mixto):
         return "Agresivo"
 
 def recomendacion_por_perfil(perfil):
-    # Conecta tu ML de mercado (lo que ya cerraste)
     if perfil == "Conservador":
         return {"estrategia": "ML", "threshold": 0.60, "mensaje": "Prioriza estabilidad y minimizar caídas."}
     if perfil == "Balanceado":
@@ -49,43 +48,63 @@ def recomendacion_por_perfil(perfil):
 @st.cache_data(show_spinner=False)
 def load_prices(ticker: str, start: str):
     df = yf.download(ticker, start=start, progress=False)
-    # yfinance a veces entrega columnas MultiIndex
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # yfinance puede devolver MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
-        # toma el primer nivel "Close"/"Adj Close" si existe
-        if ("Close", ticker) in df.columns:
+        # Preferimos Close + Volume
+        try:
             price = df[("Close", ticker)]
-        else:
-            # fallback
-            price = df.xs("Close", axis=1, level=0).iloc[:, 0]
-        if ("Volume", ticker) in df.columns:
+        except Exception:
+            try:
+                price = df.xs("Close", axis=1, level=0).iloc[:, 0]
+            except Exception:
+                return pd.DataFrame()
+
+        try:
             volume = df[("Volume", ticker)]
-        else:
-            volume = df.xs("Volume", axis=1, level=0).iloc[:, 0]
+        except Exception:
+            try:
+                volume = df.xs("Volume", axis=1, level=0).iloc[:, 0]
+            except Exception:
+                volume = pd.Series(index=df.index, data=np.nan)
+
         out = pd.DataFrame({"price": price, "volume": volume})
     else:
-        # si auto_adjust=True, a veces no viene "Adj Close"
-        price_col = "Adj Close" if "Adj Close" in df.columns else "Close"
+        price_col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+        if price_col is None or "Volume" not in df.columns:
+            return pd.DataFrame()
         out = df[[price_col, "Volume"]].rename(columns={price_col: "price", "Volume": "volume"})
 
-    out = out.dropna()
+    out = out.dropna(subset=["price"])
     out["ret"] = out["price"].pct_change()
-    return out.dropna()
+    out = out.replace([np.inf, -np.inf], np.nan).dropna()
+    return out
 
 def make_market_features(df, ma_fast=20, ma_slow=50, vol_win=20):
-    X = df.copy()
-    X["ma20"] = X["price"].rolling(ma_fast).mean()
-    X["ma50"] = X["price"].rolling(ma_slow).mean()
-    X["dist_ma20"] = (X["price"] / X["ma20"]) - 1
-    X["dist_ma50"] = (X["price"] / X["ma50"]) - 1
-    X["ret_1"] = X["ret"].shift(1)
-    X["ret_5"] = X["price"].pct_change(5)
-    X["ret_10"] = X["price"].pct_change(10)
-    X["vol20"] = X["ret"].rolling(vol_win).std()
-    X["mom20"] = X["price"] / X["price"].shift(20) - 1
+    full = df.copy()
+    full["ma20"] = full["price"].rolling(ma_fast).mean()
+    full["ma50"] = full["price"].rolling(ma_slow).mean()
 
-    features = ["dist_ma20","dist_ma50","ret_1","ret_5","ret_10","vol20","mom20"]
-    X = X.dropna(subset=features + ["ret"])
-    return X[features], X
+    full["dist_ma20"] = (full["price"] / full["ma20"]) - 1
+    full["dist_ma50"] = (full["price"] / full["ma50"]) - 1
+
+    full["ret_1"] = full["ret"].shift(1)
+    full["ret_5"] = full["price"].pct_change(5)
+    full["ret_10"] = full["price"].pct_change(10)
+    full["vol20"] = full["ret"].rolling(vol_win).std()
+    full["mom20"] = full["price"] / full["price"].shift(20) - 1
+
+    features = ["dist_ma20", "dist_ma50", "ret_1", "ret_5", "ret_10", "vol20", "mom20"]
+
+    full = full.replace([np.inf, -np.inf], np.nan)
+    # Necesitamos que features + ret estén completas
+    full = full.dropna(subset=features + ["ret"])
+
+    X = full[features].astype(float)
+    return X, full
 
 def plot_capital(dates, market, strategy, title):
     fig = go.Figure()
@@ -105,11 +124,21 @@ def plot_state(dates, signal, title):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=dates, y=signal, mode="lines", fill="tozeroy", name="Estado"))
     fig.update_layout(
-        title=title, xaxis_title="Fecha",
-        yaxis=dict(tickvals=[0,1], ticktext=["Efectivo","Invertido"]),
+        title=title,
+        xaxis_title="Fecha",
+        yaxis=dict(tickvals=[0, 1], ticktext=["Efectivo", "Invertido"]),
         height=260
     )
     return fig
+
+# -----------------------
+# Load model
+# -----------------------
+@st.cache_resource(show_spinner=False)
+def load_market_model():
+    return joblib.load("modelo_ml_mercado.pkl")
+
+model = load_market_model()
 
 # -----------------------
 # UI
@@ -117,20 +146,12 @@ def plot_state(dates, signal, title):
 st.title("DataFinscope – Piloto (Perfil + Simulación)")
 st.caption("Piloto educativo: segmentación de usuario + backtesting histórico. No es recomendación financiera.")
 
-# Cargar modelo de mercado (guardado por ti)
-@st.cache_resource(show_spinner=False)
-def load_market_model():
-    return joblib.load("modelo_ml_mercado.pkl")
-
-model = load_market_model()
-
-# Estado para guardar perfil y recomendación
 if "perfil" not in st.session_state:
     st.session_state.perfil = None
 if "rec" not in st.session_state:
     st.session_state.rec = None
 
-with st.expander("1) Perfil del usuario (desplegar y responder)", expanded=True):
+with st.expander("Perfil del usuario (desplegar y responder)", expanded=True):
     st.subheader("Cuéntanos 5 cosas (rápido)")
 
     col1, col2, col3 = st.columns(3)
@@ -142,19 +163,12 @@ with st.expander("1) Perfil del usuario (desplegar y responder)", expanded=True)
         prob_backtesting = st.slider("Probabilidad de usar simulador/backtesting (0–10)", 0, 10, 7)
     with col3:
         prob_uso = st.slider("Probabilidad de uso (1–10)", 1, 10, 7)
-        # opcional, puede ser COP mensual como proxy de compromiso
         pago_mensual = st.number_input("¿Cuánto pagarías al mes? (COP)", min_value=0, value=0, step=5000)
 
     if st.button("Calcular mi perfil"):
-        # Scores simples (MVP). Luego los ajustamos a tus columnas reales.
-        # Conocimiento: manejo + utilidad + confianza (0-100)
-        score_con = (manejo_digital/5 + utilidad_info/5 + confianza_apps/5)/3 * 100
-
-        # Riesgo/interés: prob_uso + prob_backtesting (0-100)
-        score_rie = ((prob_uso/10) + (prob_backtesting/10))/2 * 100
-
-        # Mixto 50/50 (puedes ponderar 60/40 si quieres)
-        score_mix = 0.5*score_con + 0.5*score_rie
+        score_con = (manejo_digital/5 + utilidad_info/5 + confianza_apps/5) / 3 * 100
+        score_rie = ((prob_uso/10) + (prob_backtesting/10)) / 2 * 100
+        score_mix = 0.5 * score_con + 0.5 * score_rie
 
         perfil = perfil_por_score(score_mix)
         rec = recomendacion_por_perfil(perfil)
@@ -183,6 +197,8 @@ with st.expander("1) Perfil del usuario (desplegar y responder)", expanded=True)
 st.divider()
 
 st.subheader("2) Simulación (Machine Learning de mercado)")
+st.caption("Tip: usa al menos 6–12 meses de historial para que existan MA50, mom20, etc.")
+
 colA, colB, colC, colD = st.columns(4)
 with colA:
     ticker = st.text_input("Ticker", value="AAPL")
@@ -193,10 +209,9 @@ with colC:
 with colD:
     trm = st.number_input("TRM (COP por USD)", min_value=1000, value=4000, step=50)
 
-# Usa threshold recomendado si ya hay perfil
 default_threshold = 0.55
 if st.session_state.rec:
-    default_threshold = st.session_state.rec["threshold"]
+    default_threshold = float(st.session_state.rec["threshold"])
 
 threshold = st.slider("Threshold ML (más alto = más conservador)", 0.50, 0.70, float(default_threshold), 0.01)
 
@@ -206,14 +221,40 @@ if run:
     with st.spinner("Cargando precios y ejecutando backtesting..."):
         df = load_prices(ticker, str(start))
 
+        if df.empty:
+            st.error("No se pudo descargar data para ese ticker. Revisa el ticker o intenta más tarde.")
+            st.stop()
+
+        # Necesitamos historial suficiente para rolling windows
+        if len(df) < 120:
+            st.warning(
+                f"Hay pocos datos desde esa fecha ({len(df)} filas). "
+                "Elige una fecha de inicio más antigua (ideal 6–12 meses atrás)."
+            )
+            st.stop()
+
         X, full = make_market_features(df)
+
+        # Limpieza extra antes del modelo
+        X = X.replace([np.inf, -np.inf], np.nan).dropna()
+
+        if X.empty or len(X) < 5:
+            st.warning(
+                "Después de calcular medias móviles y retornos, no quedaron filas suficientes. "
+                "Prueba una fecha de inicio más antigua."
+            )
+            st.stop()
+
+        # Asegurar tipos numéricos
+        X = X.astype(float)
+
         proba = model.predict_proba(X)[:, 1]
 
         full = full.loc[X.index].copy()
         full["p_up"] = proba
         full["signal_ml"] = (full["p_up"] >= threshold).astype(int)
 
-        # market curve
+        # Market curve
         full["cum_market"] = (1 + full["ret"]).cumprod()
         full["capital_market_usd"] = capital * full["cum_market"]
         full["capital_market_cop"] = full["capital_market_usd"] * trm
@@ -238,25 +279,37 @@ if run:
     k4.metric("Max Drawdown (Market / ML)", f"{mdd_mkt:.1%} / {mdd_ml:.1%}")
 
     # Semáforo (simple)
-    dd_abs = abs(mdd_ml)
-    if dd_abs <= 0.10:
+    dd_abs = abs(mdd_ml) if not np.isnan(mdd_ml) else np.nan
+    if np.isnan(dd_abs):
+        st.info("No se pudo calcular drawdown (datos insuficientes o retornos nulos).")
+    elif dd_abs <= 0.10:
         st.success(f"Riesgo (Drawdown ML): {mdd_ml:.1%} → Zona VERDE (bajo)")
     elif dd_abs <= 0.25:
         st.warning(f"Riesgo (Drawdown ML): {mdd_ml:.1%} → Zona AMARILLA (moderado)")
     else:
         st.error(f"Riesgo (Drawdown ML): {mdd_ml:.1%} → Zona ROJA (alto)")
 
-    # Gráficas
-    fig1 = plot_capital(full.index, full["capital_market_usd"], full["capital_strategy_ml_usd"], "Capital acumulado (USD)")
-    st.plotly_chart(fig1, use_container_width=True)
+    # Charts
+    st.plotly_chart(
+        plot_capital(full.index, full["capital_market_usd"], full["capital_strategy_ml_usd"], "Capital acumulado (USD)"),
+        use_container_width=True
+    )
 
-    fig2 = plot_drawdown(full.index, dd_mkt, dd_ml, "Drawdown (Market vs ML)")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(
+        plot_drawdown(full.index, dd_mkt, dd_ml, "Drawdown (Market vs ML)"),
+        use_container_width=True
+    )
 
-    fig3 = plot_state(full.index, full["signal_ml"], "Estado del inversionista (0 = efectivo, 1 = invertido)")
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(
+        plot_state(full.index, full["signal_ml"], "Estado del inversionista (0 = efectivo, 1 = invertido)"),
+        use_container_width=True
+    )
 
-    # Tabla resumen corta
+    # Table
     st.subheader("Tabla (últimos registros)")
-    show_cols = ["price","p_up","signal_ml","capital_market_usd","capital_strategy_ml_usd","capital_market_cop","capital_strategy_ml_cop"]
+    show_cols = [
+        "price", "p_up", "signal_ml",
+        "capital_market_usd", "capital_strategy_ml_usd",
+        "capital_market_cop", "capital_strategy_ml_cop"
+    ]
     st.dataframe(full[show_cols].tail(20))
